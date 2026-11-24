@@ -94,7 +94,10 @@ pub struct Session {
     channels: HashMap<ChannelId, ChannelRef>,
     target_window_size: u32,
     pending_reads: Vec<Vec<u8>>,
-    pending_len: u32,
+    pending_len: u64,
+    /// Bound on `pending_len` for the current key exchange, set by
+    /// `begin_rekey`.
+    pending_limit: u64,
     priority_sender: UnboundedSender<Msg>,
     priority_receiver: UnboundedReceiver<Msg>,
     inbound_channel_sender: Sender<Msg>,
@@ -1357,6 +1360,7 @@ impl Session {
             channels: HashMap::new(),
             pending_reads: Vec::new(),
             pending_len: 0,
+            pending_limit: 0,
             open_global_requests: VecDeque::new(),
             server_sig_algs: None,
             ext_info_count: 0,
@@ -1900,9 +1904,53 @@ impl Session {
         Ok(())
     }
 
+    /// How much non-kex traffic the peer may send before it sees our KEXINIT:
+    /// twice the larger of `window_size` and, with
+    /// [`Config::manual_window`], the receive window granted across all
+    /// channels (grants can open more than `window_size`, and none are sent
+    /// during the key exchange).
+    fn rekey_pending_limit(&self) -> u64 {
+        let granted = match &self.common.encrypted {
+            Some(enc) if self.common.config.manual_window => enc.receive_window_total(),
+            _ => 0,
+        };
+        rekey_pending_bound(self.common.config.window_size, granted)
+    }
+
+    /// What a non-kex message received during a key exchange counts against
+    /// `pending_limit`: its length, except that with
+    /// [`Config::manual_window`] channel data counts by its payload (at least
+    /// one byte), which is what the grants in `pending_limit` measure. Data
+    /// for a channel that is not open, such as one we closed while the peer's
+    /// data was in flight, counts nothing: it is dropped on arrival without
+    /// keeping anything. (If the channel closed after `begin_rekey`, its
+    /// credit is still in `pending_limit`; that only makes the bound looser.)
+    pub(crate) fn pending_cost(&self, packet: &[u8]) -> u64 {
+        let header = match packet.first() {
+            Some(&msg::CHANNEL_DATA) => 9,
+            Some(&msg::CHANNEL_EXTENDED_DATA) => 13,
+            _ => return packet.len() as u64,
+        };
+        if !self.common.config.manual_window {
+            return packet.len() as u64;
+        }
+        let open = packet
+            .get(1..5)
+            .and_then(|id| <[u8; 4]>::try_from(id).ok())
+            .is_some_and(|id| {
+                self.common
+                    .is_established_channel(ChannelId(u32::from_be_bytes(id)))
+            });
+        if !open {
+            return 0;
+        }
+        packet.len().saturating_sub(header).max(1) as u64
+    }
+
     fn begin_rekey(&mut self) -> Result<(), crate::Error> {
         debug!("beginning re-key");
         self.pending_len = 0;
+        self.pending_limit = self.rekey_pending_limit();
         let mut kex = ClientKex::new(
             self.common.config.clone(),
             &self.common.config.client_id,
@@ -2020,8 +2068,9 @@ async fn reply<H: Handler>(
     //   * Before it arrives (we initiated the rekey; the peer may not have seen
     //     our KEXINIT yet) their in-flight messages are legal. Handle them as
     //     usual, but bound the total so a peer that stalls the rekey and floods
-    //     cannot grow memory without limit. `pending_len` is reset when the
-    //     rekey completes (see `begin_rekey` and the kex-done path).
+    //     cannot grow memory without limit (`pending_limit`, set by
+    //     `begin_rekey`). `pending_len` is reset when the rekey completes
+    //     (see `begin_rekey` and the kex-done path).
     #[allow(clippy::collapsible_if)]
     if !is_kex_msg && session.common.encrypted.is_some() {
         if let (Some(&msg_type), SessionKexState::InProgress(kex)) =
@@ -2031,9 +2080,9 @@ async fn reply<H: Handler>(
                 if kex.peer_kexinit_received() {
                     return Err(crate::Error::Inconsistent.into());
                 }
-                session.pending_len = session.pending_len.saturating_add(pkt.buffer.len() as u32);
-                if u64::from(session.pending_len) > 2 * u64::from(session.common.config.window_size)
-                {
+                let cost = session.pending_cost(&pkt.buffer);
+                session.pending_len = session.pending_len.saturating_add(cost);
+                if session.pending_len > session.pending_limit {
                     return Err(crate::Error::Pending.into());
                 }
             }
@@ -2135,6 +2184,12 @@ async fn reply<H: Handler>(
     }
 
     session.client_read_encrypted(handler, pkt).await
+}
+
+/// Twice the larger of `window_size` and `granted`, saturating (see
+/// `Session::rekey_pending_limit`).
+fn rekey_pending_bound(window_size: u32, granted: u64) -> u64 {
+    u64::from(window_size).max(granted).saturating_mul(2)
 }
 
 #[cfg(test)]
@@ -2647,6 +2702,176 @@ mod tests {
         assert!(
             matches!(err, crate::Error::PacketSize(len) if len > crate::cipher::MAXIMUM_DECOMPRESSED_PACKET_LEN)
         );
+    }
+
+    // manual receive window (Config::manual_window): the rekey bound
+
+    fn channel_data(payload: usize) -> Vec<u8> {
+        channel_data_on(7, payload)
+    }
+
+    fn channel_data_on(channel: u32, payload: usize) -> Vec<u8> {
+        let mut packet = vec![msg::CHANNEL_DATA];
+        channel.encode(&mut packet).unwrap();
+        vec![b'x'; payload].encode(&mut packet).unwrap();
+        packet
+    }
+
+    fn channel_extended_data(payload: usize) -> Vec<u8> {
+        let mut packet = vec![msg::CHANNEL_EXTENDED_DATA];
+        7u32.encode(&mut packet).unwrap();
+        1u32.encode(&mut packet).unwrap();
+        vec![b'x'; payload].encode(&mut packet).unwrap();
+        packet
+    }
+
+    fn open_channel(id: u32, window: u32, confirmed: bool) -> crate::ChannelParams {
+        crate::ChannelParams {
+            recipient_channel: id,
+            sender_channel: ChannelId(id),
+            recipient_window_size: 0,
+            sender_window_size: window,
+            recipient_maximum_packet_size: 0,
+            sender_maximum_packet_size: 0,
+            confirmed,
+            wants_reply: false,
+            pending_data: VecDeque::new(),
+            pending_eof: false,
+            pending_close: false,
+        }
+    }
+
+    const PACKET: u32 = 32 * 1024;
+
+    fn with_manual_window(session: &mut Session, manual_window: bool) {
+        session.common.config = Arc::new(Config {
+            manual_window,
+            ..Default::default()
+        });
+    }
+
+    fn authenticated_plain_session() -> Session {
+        let (mut session, _sender, _replies) = keyboard_interactive_session();
+        session.common.encrypted.as_mut().unwrap().state = EncryptedState::Authenticated;
+        session
+    }
+
+    #[test]
+    fn pending_cost_counts_channel_data_by_payload_with_manual_window() {
+        let mut session = authenticated_plain_session();
+        with_manual_window(&mut session, true);
+        let enc = session.common.encrypted.as_mut().unwrap();
+        enc.channels.insert(ChannelId(7), open_channel(7, 0, true));
+        assert_eq!(session.pending_cost(&channel_data(1000)), 1000);
+        assert_eq!(session.pending_cost(&channel_extended_data(1000)), 1000);
+        // An empty payload still costs a byte, so a flood of them is bounded.
+        assert_eq!(session.pending_cost(&channel_data(0)), 1);
+        assert_eq!(session.pending_cost(&channel_extended_data(0)), 1);
+        // Other messages count whole.
+        assert_eq!(session.pending_cost(&[msg::IGNORE; 100]), 100);
+    }
+
+    #[test]
+    fn pending_cost_counts_nothing_for_data_on_a_channel_that_is_not_open() {
+        let mut session = authenticated_plain_session();
+        with_manual_window(&mut session, true);
+        // Channel 7 is closed (gone) or not confirmed: its data is dropped.
+        assert_eq!(session.pending_cost(&channel_data(1000)), 0);
+        assert_eq!(session.pending_cost(&channel_extended_data(1000)), 0);
+        assert_eq!(session.pending_cost(&channel_data(1)), 0);
+        let enc = session.common.encrypted.as_mut().unwrap();
+        enc.channels.insert(ChannelId(7), open_channel(7, 0, false));
+        assert_eq!(session.pending_cost(&channel_data(1000)), 0);
+        // A truncated message has no channel to look up.
+        assert_eq!(session.pending_cost(&[msg::CHANNEL_DATA, 0, 0]), 0);
+    }
+
+    #[test]
+    fn pending_cost_counts_whole_messages_without_manual_window() {
+        let mut session = authenticated_plain_session();
+        with_manual_window(&mut session, false);
+        assert_eq!(session.pending_cost(&channel_data(1000)), 1009);
+        assert_eq!(session.pending_cost(&channel_extended_data(1000)), 1013);
+        assert_eq!(session.pending_cost(&[msg::IGNORE; 100]), 100);
+    }
+
+    #[test]
+    fn rekey_pending_limit_covers_the_granted_window() {
+        let mut session = authenticated_plain_session();
+        let window = session.common.config.window_size;
+        let enc = session.common.encrypted.as_mut().unwrap();
+        for id in 0..3 {
+            enc.channels
+                .insert(ChannelId(id), open_channel(id, window, true));
+        }
+        with_manual_window(&mut session, false);
+        assert_eq!(session.rekey_pending_limit(), 2 * u64::from(window));
+        with_manual_window(&mut session, true);
+        assert_eq!(session.rekey_pending_limit(), 6 * u64::from(window));
+    }
+
+    /// What `reply` makes of `packet` while our KEXINIT is unanswered.
+    async fn reply_during_rekey(
+        session: &mut Session,
+        packet: Vec<u8>,
+    ) -> Result<(), crate::Error> {
+        let mut pkt = IncomingSshPacket {
+            buffer: packet,
+            seqn: Wrapping(0),
+        };
+        super::reply(session, &mut TestHandler, &mut None, &mut pkt).await
+    }
+
+    /// Several channels each have a full `window_size` open when we start a
+    /// key exchange; together that is more than twice `window_size`.
+    #[tokio::test]
+    async fn a_rekey_accepts_a_full_window_on_every_channel_and_cuts_off_past_the_bound() {
+        let mut session = authenticated_plain_session();
+        with_manual_window(&mut session, true);
+        allow_rekey(&mut session, crate::Limits::default());
+        let window = session.common.config.window_size;
+        let enc = session.common.encrypted.as_mut().unwrap();
+        for id in 0..3 {
+            enc.channels
+                .insert(ChannelId(id), open_channel(id, window, true));
+        }
+        session.begin_rekey().unwrap();
+        let limit = session.pending_limit;
+        assert_eq!(limit, 6 * u64::from(window));
+
+        // Data for a channel that is not open is dropped and costs nothing.
+        for _ in 0..4 * limit / u64::from(PACKET) {
+            reply_during_rekey(&mut session, channel_data_on(9, PACKET as usize))
+                .await
+                .unwrap();
+        }
+        // The whole window of every channel is legitimately in flight.
+        for id in 0..3 {
+            for _ in 0..window / PACKET {
+                reply_during_rekey(&mut session, channel_data_on(id, PACKET as usize))
+                    .await
+                    .unwrap();
+            }
+        }
+        // Data counts until the bound, then ends the session.
+        let mut sent = 3 * u64::from(window);
+        while sent + u64::from(PACKET) <= limit {
+            reply_during_rekey(&mut session, channel_data_on(0, PACKET as usize))
+                .await
+                .unwrap();
+            sent += u64::from(PACKET);
+        }
+        assert!(matches!(
+            reply_during_rekey(&mut session, channel_data_on(0, PACKET as usize)).await,
+            Err(crate::Error::Pending)
+        ));
+    }
+
+    #[test]
+    fn rekey_pending_bound_saturates() {
+        assert_eq!(rekey_pending_bound(1024, 0), 2048);
+        assert_eq!(rekey_pending_bound(1024, 5000), 10000);
+        assert_eq!(rekey_pending_bound(u32::MAX, u64::MAX / 2 + 1), u64::MAX);
     }
 }
 
