@@ -259,6 +259,11 @@ pub enum Msg {
         /// Provide a channel for the reply result to request a reply from the server
         reply_channel: Option<oneshot::Sender<Option<CryptoVec>>>,
     },
+    /// Grow a channel's receive window (see [`Config::manual_window`]).
+    WindowGrant {
+        id: ChannelId,
+        bytes: u32,
+    },
 }
 
 impl From<(ChannelId, ChannelMsg)> for Msg {
@@ -316,6 +321,7 @@ pub enum DisconnectReason<E: From<crate::Error> + Send> {
 /// the request/response cycle.
 pub struct Handle<H: Handler> {
     sender: Sender<Msg>,
+    priority_sender: UnboundedSender<Msg>,
     receiver: UnboundedReceiver<Reply>,
     join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
     channel_buffer_size: usize,
@@ -1068,6 +1074,22 @@ impl<H: Handler> Handle<H> {
             })
     }
 
+    /// Grow a channel's receive window by `bytes`, for use with
+    /// [`Config::manual_window`].
+    ///
+    /// Never waits, so it can be called from a handler, another task or a
+    /// non-async thread. The grant is sent after an ongoing key exchange.
+    ///
+    /// Grants are ignored for a channel that is not confirmed yet, that is
+    /// closing or closed, and when empty or when they would take the window
+    /// past `u32::MAX`. Without `manual_window`, a grant adds to russh's own
+    /// refills. Fails only if the session has ended.
+    pub fn grant_window(&self, id: ChannelId, bytes: u32) -> Result<(), crate::SendError> {
+        self.priority_sender
+            .send(Msg::WindowGrant { id, bytes })
+            .map_err(|_| crate::SendError {})
+    }
+
     /// Asynchronously perform a session re-key at the next opportunity
     pub async fn rekey_soon(&self) -> Result<(), Error> {
         self.sender
@@ -1258,6 +1280,7 @@ where
         session_sender,
     );
     session.begin_rekey()?;
+    let priority_sender = session.priority_sender.clone();
     let (kex_done_signal, kex_done_signal_rx) = oneshot::channel();
     let join = russh_util::runtime::spawn(session.run(stream, handler, Some(kex_done_signal)));
 
@@ -1274,6 +1297,7 @@ where
 
     Ok(Handle {
         sender: handle_sender,
+        priority_sender,
         receiver: handle_receiver,
         join,
         channel_buffer_size,
@@ -1827,6 +1851,11 @@ impl Session {
             }
             Msg::ServerChannelOpenReply { pending, result } => {
                 self.finalize_server_channel_open_reply(pending, result)?;
+            }
+            Msg::WindowGrant { id, bytes } => {
+                if let Some(ref mut enc) = self.common.encrypted {
+                    enc.grant_window(id, bytes)?;
+                }
             }
             msg => {
                 // should be unreachable, since the receiver only gets
@@ -2785,6 +2814,21 @@ pub struct Config {
     pub gex: GexParams,
     /// If active, invoke `set_nodelay(true)` on the ssh socket; disabled by default (i.e. Nagle's algorithm is active).
     pub nodelay: bool,
+    /// Per-channel receive flow control (RFC 4254 §5.2). Disabled by default:
+    /// russh refills a channel's receive window as data arrives.
+    ///
+    /// If active, data and extended data received on a channel only use up
+    /// that channel's receive window, and the window grows only through
+    /// [`Handle::grant_window`]. Each channel starts with `window_size`; the
+    /// application grants more as it consumes the data, so a slow consumer
+    /// stops only its own channel. [`Handler::adjust_window`] is not called
+    /// in this mode.
+    ///
+    /// Data is still delivered to the [`Handler`] and to the [`Channel`] as it
+    /// arrives, also data a misbehaving server sends past the window. A
+    /// `Channel` buffers at most `channel_buffer_size` messages whatever their
+    /// size, so a `Channel` user still has to keep reading it.
+    pub manual_window: bool,
 }
 
 impl Default for Config {
@@ -2807,6 +2851,7 @@ impl Default for Config {
             anonymous: false,
             gex: Default::default(),
             nodelay: false,
+            manual_window: false,
         }
     }
 }
